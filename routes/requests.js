@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/firebase');
+const { pool } = require('../config/database');
 const logger = require('../utils/logger');
 const { asyncHandler, AppError } = require('../middleware/errorHandler');
 const { validate, validationRules } = require('../middleware/validator');
@@ -32,28 +32,40 @@ router.get('/', validate(validationRules.pagination), asyncHandler(async (req, r
     const bloodGroup = req.query.blood_group;
     const emergency = req.query.emergency;
 
-    let ref = db.collection('blood_requests');
-    if (status) ref = ref.where('status', '==', status);
-    if (bloodGroup) ref = ref.where('blood_group', '==', bloodGroup);
-    if (emergency !== undefined) ref = ref.where('is_emergency', '==', parseInt(emergency));
-
-    const countSnap = await ref.count().get();
-    const total = countSnap.data().count;
-
-    const snap = await ref.orderBy('is_emergency', 'desc').orderBy('created_at', 'desc').limit(limit).offset(offset).get();
+    const filters = [];
+    const values = [];
+    if (status) {
+        values.push(status);
+        filters.push(`status = $${values.length}`);
+    }
+    if (bloodGroup) {
+        values.push(bloodGroup);
+        filters.push(`blood_group = $${values.length}`);
+    }
+    if (emergency !== undefined) {
+        values.push(emergency === '1' || emergency === 'true');
+        filters.push(`is_emergency = $${values.length}`);
+    }
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const countResult = await pool.query(`SELECT COUNT(*)::int AS count FROM blood_requests ${where}`, values);
+    const total = countResult.rows[0].count;
+    const { rows } = await pool.query(
+        `SELECT * FROM blood_requests ${where} ORDER BY is_emergency DESC, created_at DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+        [...values, limit, offset]
+    );
 
     res.json({
         success: true,
-        data: snap.docs.map(doc => ({ id: doc.id, ...doc.data() })),
+        data: rows,
         pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
     });
 }));
 
 // Get request by ID
 router.get('/:id', validate(validationRules.idParam), asyncHandler(async (req, res) => {
-    const doc = await db.collection('blood_requests').doc(req.params.id).get();
-    if (!doc.exists) throw new AppError('Request not found', 404);
-    res.json({ success: true, data: { id: doc.id, ...doc.data() } });
+    const { rows } = await pool.query('SELECT * FROM blood_requests WHERE id = $1', [req.params.id]);
+    if (rows.length === 0) throw new AppError('Request not found', 404);
+    res.json({ success: true, data: rows[0] });
 }));
 
 // Create blood request
@@ -61,64 +73,46 @@ router.post('/', registerLimiter, validate(validationRules.bloodRequest), asyncH
     const { patient_name, blood_group, units, hospital, phone, needed_date, is_emergency } = req.body;
     const isEmergency = is_emergency ? 1 : 0;
 
-    const ref = await db.collection('blood_requests').add({
-        patient_name,
-        blood_group,
-        units: parseInt(units),
-        hospital,
-        phone,
-        needed_date,
-        is_emergency: isEmergency,
-        status: 'Pending',
-        created_at: new Date()
-    });
+    const { rows } = await pool.query(
+        `INSERT INTO blood_requests (patient_name, blood_group, units, hospital, phone, needed_date, is_emergency)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+        [patient_name, blood_group, parseInt(units), hospital, phone, needed_date, Boolean(isEmergency)]
+    );
+    const requestId = rows[0].id;
 
     logger.info(`New blood request created: ${blood_group} at ${hospital}`);
 
     // Notify compatible donors (async)
     const compatibleGroups = getCompatibleBloodGroups(blood_group);
     if (compatibleGroups.length > 0) {
-        db.collection('donors')
-            .where('blood_group', 'in', compatibleGroups)
-            .where('availability', '==', 1)
-            .get()
-            .then(async donorSnap => {
-                const donorIds = donorSnap.docs.map(d => d.id);
-                if (donorIds.length === 0) return;
-
-                // Only notify donors with accounts
-                const accountSnaps = await Promise.all(
-                    donorIds.map(id => db.collection('donor_accounts').where('donor_id', '==', id).limit(1).get())
-                );
-
+        pool.query(
+            `SELECT d.email, d.fullname FROM donors d
+             INNER JOIN donor_accounts a ON a.donor_id = d.id
+             WHERE d.blood_group = ANY($1::varchar[]) AND d.availability = TRUE`,
+            [compatibleGroups]
+        )
+            .then(({ rows: matchingDonors }) => {
                 const requestDetails = { patient_name, blood_group, units, hospital, phone, needed_date, is_emergency: isEmergency };
-                let notified = 0;
-
-                accountSnaps.forEach((snap, i) => {
-                    if (!snap.empty) {
-                        const donor = donorSnap.docs[i].data();
-                        notificationService.notifyDonorMatch(donor.email, donor.fullname, requestDetails)
-                            .catch(e => logger.error(`Notification failed for ${donor.email}: ${e.message}`));
-                        notified++;
-                    }
+                matchingDonors.forEach(donor => {
+                    notificationService.notifyDonorMatch(donor.email, donor.fullname, requestDetails)
+                        .catch(e => logger.error(`Notification failed for ${donor.email}: ${e.message}`));
                 });
-
-                logger.info(`Notified ${notified} registered donors for request ID ${ref.id}`);
+                logger.info(`Notified ${matchingDonors.length} registered donors for request ID ${requestId}`);
             })
             .catch(e => logger.error('Donor query failed for notifications:', e.message));
     }
 
-    res.json({ success: true, message: 'Request created successfully', id: ref.id });
+    res.json({ success: true, message: 'Request created successfully', id: requestId });
 }));
 
 // Update request status
 router.put('/:id/status', authenticateToken, validate(validationRules.requestStatusUpdate), asyncHandler(async (req, res) => {
     const { status } = req.body;
-    const docRef = db.collection('blood_requests').doc(req.params.id);
-    const doc = await docRef.get();
-    if (!doc.exists) throw new AppError('Request not found', 404);
-
-    await docRef.update({ status, updated_at: new Date() });
+    const result = await pool.query(
+        'UPDATE blood_requests SET status = $1, updated_at = NOW() WHERE id = $2',
+        [status, req.params.id]
+    );
+    if (result.rowCount === 0) throw new AppError('Request not found', 404);
     logger.info(`Request ${req.params.id} status updated to ${status}`);
 
     res.json({ success: true, message: 'Request status updated', status });
@@ -126,11 +120,8 @@ router.put('/:id/status', authenticateToken, validate(validationRules.requestSta
 
 // Delete request
 router.delete('/:id', authenticateToken, validate(validationRules.idParam), asyncHandler(async (req, res) => {
-    const docRef = db.collection('blood_requests').doc(req.params.id);
-    const doc = await docRef.get();
-    if (!doc.exists) throw new AppError('Request not found', 404);
-
-    await docRef.delete();
+    const result = await pool.query('DELETE FROM blood_requests WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) throw new AppError('Request not found', 404);
     logger.info(`Request deleted: ID ${req.params.id}`);
     res.json({ success: true, message: 'Request deleted successfully' });
 }));

@@ -1,36 +1,49 @@
-const { Resend } = require('resend');
 const logger = require('./logger');
 
 class NotificationService {
-    constructor() {
-        this.resend = process.env.RESEND_API_KEY
-            ? new Resend(process.env.RESEND_API_KEY)
-            : null;
+  getSender() {
+    const configuredSender = process.env.EMAIL_FROM || 'BloodLife <noreply@bloodlife.com>';
+    const match = configuredSender.match(/^(.*?)\s*<([^>]+)>$/);
+
+    return match
+      ? { name: match[1].trim() || 'BloodLife', email: match[2].trim() }
+      : { name: 'BloodLife', email: configuredSender.trim() };
     }
 
     async sendEmail(to, subject, html) {
         try {
-            if (!this.resend) {
-                logger.warn('RESEND_API_KEY not configured, skipping email send');
+      const apiKey = process.env.BREVO_API_KEY;
+      if (!apiKey) {
+        logger.warn('BREVO_API_KEY not configured, skipping email send');
                 return { success: false, message: 'Email not configured' };
             }
 
-            const { data, error } = await this.resend.emails.send({
-                from: process.env.EMAIL_FROM || 'BloodLife <onboarding@resend.dev>',
-                to,
-                subject,
-                html
-            });
+      const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+          'api-key': apiKey,
+          'content-type': 'application/json',
+          accept: 'application/json'
+        },
+        body: JSON.stringify({
+          sender: this.getSender(),
+          to: [{ email: to }],
+          subject,
+          htmlContent: html
+        })
+      });
+      const result = await response.json().catch(() => ({}));
 
-            if (error) {
-                logger.error(`Email send failed: ${error.message}`);
-                return { success: false, error: error.message };
-            }
+      if (!response.ok) {
+        const message = result.message || `HTTP ${response.status}`;
+        logger.error(`Brevo email send failed: ${message}`);
+        return { success: false, error: message };
+      }
 
-            logger.info(`Email sent: ${data.id}`);
-            return { success: true, messageId: data.id };
+      logger.info(`Email sent through Brevo: ${result.messageId || 'accepted'}`);
+      return { success: true, messageId: result.messageId };
         } catch (error) {
-            logger.error(`Email send failed: ${error.message}`);
+      logger.error(`Brevo email send failed: ${error.message}`);
             return { success: false, error: error.message };
         }
     }

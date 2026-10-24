@@ -1,251 +1,34 @@
-const mysql = require('mysql2');
 const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
+const { Pool } = require('pg');
 const logger = require('../utils/logger');
 
-// Parse DATABASE_URL if provided (Railway format)
-let dbConfig = {};
-let DB_NAME = process.env.DB_NAME;
-
-if (process.env.DATABASE_URL || process.env.MYSQL_URL) {
-    // Parse Railway's DATABASE_URL or MYSQL_URL
-    try {
-        const url = new URL(process.env.DATABASE_URL || process.env.MYSQL_URL);
-        dbConfig = {
-            host: url.hostname,
-            port: url.port || 3306,
-            user: url.username,
-            password: url.password,
-            waitForConnections: true,
-            connectionLimit: 10,
-            queueLimit: 0,
-            multipleStatements: true,
-            ssl: { rejectUnauthorized: false }
-        };
-        DB_NAME = url.pathname.slice(1);
-        logger.info('Using DATABASE_URL for connection');
-    } catch (error) {
-        logger.error('Failed to parse DATABASE_URL:', error);
-        process.exit(1);
-    }
-} else if (process.env.MYSQLHOST) {
-    // Railway individual MySQL plugin variables
-    dbConfig = {
-        host: process.env.MYSQLHOST,
-        port: process.env.MYSQLPORT || 3306,
-        user: process.env.MYSQLUSER,
-        password: process.env.MYSQLPASSWORD || '',
-        waitForConnections: true,
-        connectionLimit: 10,
-        queueLimit: 0,
-        multipleStatements: true,
-        ssl: { rejectUnauthorized: false }
-    };
-    DB_NAME = process.env.MYSQLDATABASE || process.env.DB_NAME;
-    logger.info('Using Railway MYSQL variables for connection');
-} else {
-    // Use individual environment variables (local)
-    dbConfig = {
-        host: process.env.DB_HOST,
-        port: process.env.DB_PORT || 3306,
-        user: process.env.DB_USER,
-        password: process.env.DB_PASSWORD || '',
-        waitForConnections: true,
-        connectionLimit: 10,
-        queueLimit: 0,
-        multipleStatements: true
-    };
-    logger.info('Using individual DB variables for connection');
+if (!process.env.DATABASE_URL) {
+    throw new Error('Missing required environment variable: DATABASE_URL');
 }
 
-const apiDb = mysql.createPool({
-    ...dbConfig,
-    database: DB_NAME
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: Number(process.env.PG_POOL_MAX || 5)
 });
 
-function initDatabase() {
-    logger.info('Initializing database connection...');
-    const initDbInfo = mysql.createConnection({
-        host: dbConfig.host,
-        port: dbConfig.port,
-        user: dbConfig.user,
-        password: dbConfig.password,
-        ssl: dbConfig.ssl
-    });
+pool.on('error', (error) => logger.error('Unexpected PostgreSQL pool error:', error));
 
-    initDbInfo.connect((err) => {
-        if (err) {
-            logger.error('Error connecting to MySQL server:', err);
-            process.exit(1);
-        }
-        logger.info('Connected to MySQL server for initialization.');
+async function initDatabase() {
+    const schemaPath = path.join(__dirname, '../database/neon-schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf8');
+    await pool.query(schema);
 
-        initDbInfo.query(`CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\``, (err) => {
-            if (err) {
-                logger.error('Error creating database:', err);
-                initDbInfo.end();
-                return;
-            }
+    const passwordHash = await bcrypt.hash(process.env.DEFAULT_ADMIN_PASSWORD || 'Admin@12345', 10);
+    await pool.query(
+        `INSERT INTO admins (username, password_hash, role)
+         VALUES ($1, $2, 'super_admin')
+         ON CONFLICT (username) DO NOTHING`,
+        [process.env.DEFAULT_ADMIN_USERNAME || 'admin', passwordHash]
+    );
 
-            initDbInfo.changeUser({ database: DB_NAME }, (err) => {
-                if (err) {
-                    logger.error('Error switching database:', err);
-                    initDbInfo.end();
-                    return;
-                }
-
-                const checkTable = "SHOW TABLES LIKE 'admins'";
-                initDbInfo.query(checkTable, (err, results) => {
-                    if (!err && results.length === 0) {
-                        logger.info('Tables missing. Running database.sql...');
-                        const sqlPath = path.join(__dirname, '../database/database.sql');
-                        fs.readFile(sqlPath, 'utf8', (err, data) => {
-                            if (err) {
-                                logger.error('Error reading database.sql:', err);
-                            } else {
-                                // Strip CREATE DATABASE and USE statements — we're already connected to the right DB
-                                const cleanedSql = data
-                                    .split('\n')
-                                    .filter(line => {
-                                        const trimmed = line.trim().toUpperCase();
-                                        return !trimmed.startsWith('CREATE DATABASE') && !trimmed.startsWith('USE ');
-                                    })
-                                    .join('\n');
-                                initDbInfo.query(cleanedSql, async (err) => {
-                                    if (err) logger.error('Error executing SQL script:', err);
-                                    else {
-                                        logger.info('Database initialized from SQL script.');
-                                        await updateDefaultAdmin();
-                                        await runMigrations(initDbInfo);
-                                    }
-                                });
-                            }
-                        });
-                    } else {
-                        logger.info('Tables exist. Running migrations...');
-                        runMigrations(initDbInfo);
-                    }
-                });
-            });
-        });
-    });
+    logger.info('Neon Postgres schema initialized.');
 }
 
-async function updateDefaultAdmin() {
-    try {
-        const hashedPassword = await bcrypt.hash(process.env.DEFAULT_ADMIN_PASSWORD || 'Admin@12345', 10);
-        const updateAdmin = 'UPDATE admins SET password_hash = ? WHERE username = ?';
-        apiDb.query(updateAdmin, [hashedPassword, process.env.DEFAULT_ADMIN_USERNAME || 'admin'], (err) => {
-            if (!err) logger.info('Updated default admin password to bcrypt hash.');
-        });
-    } catch (e) {
-        logger.error('Error updating admin password:', e);
-    }
-}
-
-async function runMigrations(connection) {
-    logger.info('Running database migrations...');
-    
-    // Migration queries with conditional column addition
-    const migrations = [
-        // Check and add columns to admins
-        `ALTER TABLE admins ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`.replace('IF NOT EXISTS', ''),
-        `ALTER TABLE admins ADD COLUMN IF NOT EXISTS role ENUM('super_admin', 'admin') DEFAULT 'admin'`.replace('IF NOT EXISTS', ''),
-        `ALTER TABLE admins ADD COLUMN IF NOT EXISTS email VARCHAR(100) NULL`.replace('IF NOT EXISTS', ''),
-        `ALTER TABLE admins ADD COLUMN IF NOT EXISTS reset_token VARCHAR(255) NULL`.replace('IF NOT EXISTS', ''),
-        `ALTER TABLE admins ADD COLUMN IF NOT EXISTS reset_token_expiry DATETIME NULL`.replace('IF NOT EXISTS', ''),
-        
-        // Check and add columns to donors
-        `ALTER TABLE donors ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`.replace('IF NOT EXISTS', ''),
-        `ALTER TABLE donors ADD COLUMN IF NOT EXISTS availability TINYINT(1) DEFAULT 1`.replace('IF NOT EXISTS', ''),
-        `ALTER TABLE donors ADD COLUMN IF NOT EXISTS profile_picture VARCHAR(255) DEFAULT NULL`.replace('IF NOT EXISTS', ''),
-        
-        // Check and add columns to blood_requests
-        `ALTER TABLE blood_requests ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`.replace('IF NOT EXISTS', ''),
-        `ALTER TABLE blood_requests ADD COLUMN IF NOT EXISTS is_emergency TINYINT(1) DEFAULT 0`.replace('IF NOT EXISTS', ''),
-        
-        // Create new tables
-        `CREATE TABLE IF NOT EXISTS donations (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            donor_id INT NOT NULL,
-            donation_date DATE NOT NULL,
-            location VARCHAR(150) NOT NULL,
-            units INT DEFAULT 1,
-            notes TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            FOREIGN KEY (donor_id) REFERENCES donors(id) ON DELETE CASCADE
-        )`,
-        
-        `CREATE TABLE IF NOT EXISTS notifications (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            recipient_email VARCHAR(100) NOT NULL,
-            recipient_phone VARCHAR(20),
-            subject VARCHAR(200) NOT NULL,
-            message TEXT NOT NULL,
-            type ENUM('email', 'sms', 'both') DEFAULT 'email',
-            status ENUM('pending', 'sent', 'failed') DEFAULT 'pending',
-            sent_at TIMESTAMP NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )`,
-        
-        `CREATE TABLE IF NOT EXISTS donor_accounts (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            donor_id INT NOT NULL UNIQUE,
-            email VARCHAR(100) NOT NULL UNIQUE,
-            password_hash VARCHAR(255) NOT NULL,
-            is_verified TINYINT(1) DEFAULT 0,
-            verification_token VARCHAR(255),
-            reset_token VARCHAR(255),
-            reset_token_expiry DATETIME,
-            last_login TIMESTAMP NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            FOREIGN KEY (donor_id) REFERENCES donors(id) ON DELETE CASCADE
-        )`,
-        
-        // Add indexes
-        `CREATE INDEX idx_donors_blood_group ON donors(blood_group)`,
-        `CREATE INDEX idx_donors_availability ON donors(availability)`,
-        `CREATE INDEX idx_donors_email ON donors(email)`,
-        `CREATE INDEX idx_requests_blood_group ON blood_requests(blood_group)`,
-        `CREATE INDEX idx_requests_status ON blood_requests(status)`,
-        `CREATE INDEX idx_requests_emergency ON blood_requests(is_emergency)`,
-        `CREATE INDEX idx_donations_donor_id ON donations(donor_id)`,
-        `CREATE INDEX idx_donations_date ON donations(donation_date)`,
-        
-        // Update admin role
-        `UPDATE admins SET role = 'super_admin' WHERE username = 'admin' AND role = 'admin'`
-    ];
-
-    for (const migration of migrations) {
-        try {
-            await new Promise((resolve, reject) => {
-                connection.query(migration, (err, result) => {
-                    if (err) {
-                        // Ignore duplicate column/index errors
-                        if (err.code === 'ER_DUP_FIELDNAME' || err.code === 'ER_DUP_KEYNAME') {
-                            resolve();
-                        } else {
-                            logger.warn(`Migration warning: ${err.message}`);
-                            resolve(); // Continue with other migrations
-                        }
-                    } else {
-                        resolve();
-                    }
-                });
-            });
-        } catch (e) {
-            logger.error(`Migration error: ${e.message}`);
-        }
-    }
-
-    logger.info('Database migrations completed.');
-    connection.end();
-}
-
-initDatabase();
-
-module.exports = apiDb.promise();
+module.exports = { pool, initDatabase };

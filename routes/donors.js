@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/firebase');
+const { pool } = require('../config/database');
 const logger = require('../utils/logger');
 const { asyncHandler, AppError } = require('../middleware/errorHandler');
 const { validate, validationRules } = require('../middleware/validator');
@@ -32,20 +32,27 @@ router.get('/', validate(validationRules.pagination), asyncHandler(async (req, r
     const availability = req.query.availability;
     const location = req.query.location;
 
-    let ref = db.collection('donors');
-    if (bloodGroup) ref = ref.where('blood_group', '==', bloodGroup);
-    if (availability !== undefined) ref = ref.where('availability', '==', parseInt(availability));
-
-    const countSnap = await ref.count().get();
-    const total = countSnap.data().count;
-
-    const snap = await ref.orderBy('created_at', 'desc').limit(limit).offset(offset).get();
-    let results = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
-    // Client-side filter for location (Firestore doesn't support LIKE)
-    if (location) {
-        results = results.filter(d => d.address && d.address.toLowerCase().includes(location.toLowerCase()));
+    const filters = [];
+    const values = [];
+    if (bloodGroup) {
+        values.push(bloodGroup);
+        filters.push(`blood_group = $${values.length}`);
     }
+    if (availability !== undefined) {
+        values.push(availability === '1' || availability === 'true');
+        filters.push(`availability = $${values.length}`);
+    }
+    if (location) {
+        values.push(`%${location}%`);
+        filters.push(`address ILIKE $${values.length}`);
+    }
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const countResult = await pool.query(`SELECT COUNT(*)::int AS count FROM donors ${where}`, values);
+    const total = countResult.rows[0].count;
+    const { rows: results } = await pool.query(
+        `SELECT * FROM donors ${where} ORDER BY created_at DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+        [...values, limit, offset]
+    );
 
     res.json({
         success: true,
@@ -56,17 +63,17 @@ router.get('/', validate(validationRules.pagination), asyncHandler(async (req, r
 
 // Get donor by ID
 router.get('/:id', validate(validationRules.idParam), asyncHandler(async (req, res) => {
-    const doc = await db.collection('donors').doc(req.params.id).get();
-    if (!doc.exists) throw new AppError('Donor not found', 404);
-    res.json({ success: true, data: { id: doc.id, ...doc.data() } });
+    const { rows } = await pool.query('SELECT * FROM donors WHERE id = $1', [req.params.id]);
+    if (rows.length === 0) throw new AppError('Donor not found', 404);
+    res.json({ success: true, data: rows[0] });
 }));
 
 // Get donor eligibility
 router.get('/:id/eligibility', validate(validationRules.idParam), asyncHandler(async (req, res) => {
-    const doc = await db.collection('donors').doc(req.params.id).get();
-    if (!doc.exists) throw new AppError('Donor not found', 404);
+    const { rows } = await pool.query('SELECT last_donation_date FROM donors WHERE id = $1', [req.params.id]);
+    if (rows.length === 0) throw new AppError('Donor not found', 404);
 
-    const { last_donation_date } = doc.data();
+    const { last_donation_date } = rows[0];
     const eligible = isDonorEligible(last_donation_date);
     const daysUntilEligible = getDaysUntilEligible(last_donation_date);
 
@@ -87,17 +94,16 @@ router.get('/compatible/:bloodGroup', asyncHandler(async (req, res) => {
     const compatibleGroups = getCompatibleBloodGroups(bloodGroup);
     if (compatibleGroups.length === 0) throw new AppError('Invalid blood group', 400);
 
-    const snap = await db.collection('donors')
-        .where('blood_group', 'in', compatibleGroups)
-        .where('availability', '==', 1)
-        .orderBy('created_at', 'desc')
-        .get();
+    const { rows } = await pool.query(
+        'SELECT * FROM donors WHERE blood_group = ANY($1::varchar[]) AND availability = TRUE ORDER BY created_at DESC',
+        [compatibleGroups]
+    );
 
     res.json({
         success: true,
         blood_group: bloodGroup,
         compatible_groups: compatibleGroups,
-        data: snap.docs.map(doc => ({ id: doc.id, ...doc.data() }))
+        data: rows
     });
 }));
 
@@ -106,43 +112,49 @@ router.post('/register', registerLimiter, validate(validationRules.donorRegister
     const { fullname, age, gender, blood_group, phone, email, address, last_donation_date, availability } = req.body;
 
     // Check duplicate email
-    const existing = await db.collection('donors').where('email', '==', email).limit(1).get();
-    if (!existing.empty) throw new AppError('Email already registered', 400);
+    const existing = await pool.query('SELECT 1 FROM donors WHERE email = $1 LIMIT 1', [email]);
+    if (existing.rowCount > 0) throw new AppError('Email already registered', 400);
 
-    const ref = await db.collection('donors').add({
-        fullname,
-        age: parseInt(age),
-        gender,
-        blood_group,
-        phone,
-        email,
-        address,
-        last_donation_date: last_donation_date || null,
-        availability: availability !== undefined ? availability : 1,
-        profile_picture: null,
-        created_at: new Date()
-    });
+    const { rows } = await pool.query(
+        `INSERT INTO donors (fullname, age, gender, blood_group, phone, email, address, last_donation_date, availability)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+        [fullname, parseInt(age), gender, blood_group, phone, email, address, last_donation_date || null, availability !== undefined ? availability : true]
+    );
 
     logger.info(`New donor registered: ${email}`);
     notificationService.sendWelcomeEmail(email, fullname).catch(e => logger.error('Welcome email failed:', e));
 
-    res.json({ success: true, message: 'Donor registered successfully', id: ref.id });
+    res.json({ success: true, message: 'Donor registered successfully', id: rows[0].id });
 }));
 
 // Update donor
 router.put('/:id', authenticateToken, validate(validationRules.donorUpdate), asyncHandler(async (req, res) => {
     const { fullname, age, gender, blood_group, phone, email, address, last_donation_date, availability } = req.body;
-    const ref = db.collection('donors').doc(req.params.id);
-    const doc = await ref.get();
-    if (!doc.exists) throw new AppError('Donor not found', 404);
+    const { rows: existingDonors } = await pool.query('SELECT email FROM donors WHERE id = $1', [req.params.id]);
+    if (existingDonors.length === 0) throw new AppError('Donor not found', 404);
 
     // Check duplicate email (exclude self)
-    if (email && email !== doc.data().email) {
-        const existing = await db.collection('donors').where('email', '==', email).limit(1).get();
-        if (!existing.empty) throw new AppError('Email already exists', 400);
+    if (email && email !== existingDonors[0].email) {
+        const existing = await pool.query('SELECT 1 FROM donors WHERE email = $1 LIMIT 1', [email]);
+        if (existing.rowCount > 0) throw new AppError('Email already exists', 400);
     }
 
-    await ref.update({ fullname, age: parseInt(age), gender, blood_group, phone, email, address, last_donation_date: last_donation_date || null, availability, updated_at: new Date() });
+    const updates = { fullname, age, gender, blood_group, phone, email, address, last_donation_date, availability };
+    const fields = Object.entries(updates).filter(([, value]) => value !== undefined);
+    if (fields.length === 0) throw new AppError('No fields to update', 400);
+
+    const values = fields.map(([field, value]) => {
+        if (field === 'age') return parseInt(value);
+        if (field === 'availability') return value === true || value === 1 || value === '1' || value === 'true';
+        return value;
+    });
+    const assignments = fields.map(([field], index) => `${field} = $${index + 1}`);
+    assignments.push('updated_at = NOW()');
+    values.push(req.params.id);
+    await pool.query(
+        `UPDATE donors SET ${assignments.join(', ')} WHERE id = $${values.length}`,
+        values
+    );
 
     logger.info(`Donor updated: ID ${req.params.id}`);
     res.json({ success: true, message: 'Donor updated successfully' });
@@ -155,22 +167,20 @@ router.patch('/:id/availability', authenticateToken, validate(validationRules.id
         throw new AppError('Availability must be boolean or number (0/1)', 400);
     }
 
-    const ref = db.collection('donors').doc(req.params.id);
-    const doc = await ref.get();
-    if (!doc.exists) throw new AppError('Donor not found', 404);
-
-    await ref.update({ availability, updated_at: new Date() });
+    const normalizedAvailability = availability === true || availability === 1 || availability === '1' || availability === 'true';
+    const result = await pool.query(
+        'UPDATE donors SET availability = $1, updated_at = NOW() WHERE id = $2',
+        [normalizedAvailability, req.params.id]
+    );
+    if (result.rowCount === 0) throw new AppError('Donor not found', 404);
     logger.info(`Donor availability updated: ID ${req.params.id}`);
     res.json({ success: true, message: 'Availability updated' });
 }));
 
 // Delete donor
 router.delete('/:id', authenticateToken, validate(validationRules.idParam), asyncHandler(async (req, res) => {
-    const ref = db.collection('donors').doc(req.params.id);
-    const doc = await ref.get();
-    if (!doc.exists) throw new AppError('Donor not found', 404);
-
-    await ref.delete();
+    const result = await pool.query('DELETE FROM donors WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) throw new AppError('Donor not found', 404);
     logger.info(`Donor deleted: ID ${req.params.id}`);
     res.json({ success: true, message: 'Donor deleted successfully' });
 }));

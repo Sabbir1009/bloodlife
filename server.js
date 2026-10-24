@@ -4,13 +4,9 @@ const helmet = require('helmet');
 const cors = require('cors');
 const path = require('path');
 const logger = require('./utils/logger');
+const { initDatabase } = require('./config/database');
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
 const { apiLimiter } = require('./middleware/rateLimiter');
-
-if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-    logger.error('Missing required environment variable: FIREBASE_SERVICE_ACCOUNT');
-    process.exit(1);
-}
 
 if (!process.env.JWT_SECRET) {
     logger.error('Missing required environment variable: JWT_SECRET');
@@ -54,9 +50,6 @@ app.use('/api/', apiLimiter);
 // Static files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Initialize database
-require('./config/firebase');
-
 // Swagger Documentation
 const { swaggerUi, swaggerSpec } = require('./config/swagger');
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
@@ -66,6 +59,7 @@ app.use('/api/admin', require('./routes/admin'));
 app.use('/api/donors', require('./routes/donors'));
 app.use('/api/requests', require('./routes/requests'));
 app.use('/api/donor-auth', require('./routes/donorAuth'));
+app.use('/api/neon', require('./routes/neon'));
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -82,15 +76,26 @@ app.use(notFoundHandler);
 // Error handling middleware (must be last)
 app.use(errorHandler);
 
-// Start server
-const server = app.listen(PORT, () => {
-    logger.info(`🚀 Server running on http://localhost:${PORT}`);
-    logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
-});
+let server;
+
+if (require.main === module) {
+    initDatabase()
+        .then(() => {
+            server = app.listen(PORT, () => {
+                logger.info(`🚀 Server running on http://localhost:${PORT}`);
+                logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
+            });
+        })
+        .catch((error) => {
+            logger.error('Neon Postgres initialization failed:', error);
+            process.exit(1);
+        });
+}
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
     logger.info('SIGTERM signal received: closing HTTP server');
+    if (!server) return process.exit(0);
     server.close(() => {
         logger.info('HTTP server closed');
         process.exit(0);
@@ -99,6 +104,7 @@ process.on('SIGTERM', () => {
 
 process.on('SIGINT', () => {
     logger.info('SIGINT signal received: closing HTTP server');
+    if (!server) return process.exit(0);
     server.close(() => {
         logger.info('HTTP server closed');
         process.exit(0);

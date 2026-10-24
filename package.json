@@ -9,7 +9,7 @@
     "test": "jest --coverage",
     "test:watch": "jest --watch",
     "seed": "node seed-demo-data.js",
-    "build": "echo 'No build needed'"
+    "build": "node --check server.js && node --check config/database.js && node --check routes/admin.js && node --check routes/donors.js && node --check routes/requests.js && node --check routes/donorAuth.js && node --check routes/neon.js && node --check utils/notificationService.js"
   },
   "keywords": [
     "blood-donation",
@@ -26,6 +26,9 @@
     "npm": ">=9.0.0"
   },
   "dependencies": {
+    "@neon/config": "^1.9.3",
+    "@neon/env": "^1.6.4",
+    "@neon/realtime": "^0.1.2",
     "bcryptjs": "^3.0.3",
     "body-parser": "^2.2.2",
     "cloudinary": "^1.41.3",
@@ -34,18 +37,18 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
     "express-validator": "^7.3.1",
-    "firebase-admin": "^13.6.1",
     "helmet": "^8.1.0",
     "jest": "^30.2.0",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.0.2",
     "multer-storage-cloudinary": "^4.0.0",
     "nodemailer": "^8.0.1",
-    "resend": "^6.9.2",
+    "pg": "^8.23.1",
     "supertest": "^7.2.2",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
-    "winston": "^3.19.0"
+    "winston": "^3.19.0",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.11"

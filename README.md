@@ -28,33 +28,16 @@ A comprehensive blood donation management system with donor registration, blood 
 - 📝 Comprehensive API documentation (Swagger)
 - 🔍 Advanced search and filtering
 
-## 🌱 Load Demo Data
+## 🌱 Initial Data
 
-We've included 15 complete donor profiles with accounts, donation history, and blood requests for testing.
-
-**Quick setup:**
-```bash
-npm run seed
-```
-
-Or manually:
-```bash
-node seed-demo-data.js
-```
-
-**Demo Login Credentials:**
-- **Donor Accounts**: Use any email from DEMO_USERS.md
-- **Password**: `Demo@12345`
-- **Admin**: username `admin`, password `Admin@12345`
-
-See `DEMO_USERS.md` for complete list of test accounts and data.
+New Neon branches start with the default admin account and an empty donor/request database. The legacy demo seed scripts target MySQL and are not compatible with the Neon PostgreSQL schema. Register donors and create requests through the app or API.
 
 ---
 
 ## 📋 Prerequisites
 
-- Node.js (v14 or higher)
-- MySQL (v5.7 or higher)
+- Node.js (v20.19 or higher)
+- A linked Neon project with PostgreSQL enabled
 - npm or yarn
 
 ## ⚙️ Installation
@@ -70,23 +53,21 @@ See `DEMO_USERS.md` for complete list of test accounts and data.
    npm install
    ```
 
-3. **Configure environment variables**
-   ```bash
-   cp .env.example .env
-   ```
-   Edit `.env` with your configuration:
+3. **Pull Neon environment variables** (the repository is linked to the `production` branch)
+  ```bash
+  neon env pull
+  ```
+  Keep the Neon-generated `DATABASE_URL` and `NEON_*` values. Set app-specific values in `.env`:
    ```env
-   DB_HOST=localhost
-   DB_USER=root
-   DB_PASSWORD=your_password
-   DB_NAME=blood_donation_system
    PORT=3000
    JWT_SECRET=your_super_secret_jwt_key_at_least_32_chars
+  DEFAULT_ADMIN_USERNAME=admin
+  DEFAULT_ADMIN_PASSWORD=change-this-password
    ```
 
 4. **Start the server**
    ```bash
-   npm start
+  npm start
    ```
    For development with auto-reload:
    ```bash
@@ -134,6 +115,12 @@ Authorization: Bearer <your-jwt-token>
 - `POST /api/requests` - Create new request
 - `PUT /api/requests/:id/status` - Update request status (auth required)
 - `DELETE /api/requests/:id` - Delete request (auth required)
+
+#### Neon Services
+- `GET /api/neon/auth/session` - Check the current Neon Auth session
+- `GET /api/neon/functions/hello` - Invoke the deployed Neon hello function
+- `GET /api/neon/realtime/donors` - Get an admin-authorized sealed live donor query
+- `POST /api/neon/ai/chat` - Send an admin-authorized chat request through the Neon AI Gateway (requires a paid Neon plan)
 
 ### Query Parameters
 
@@ -255,12 +242,9 @@ npm test -- --coverage
 ## 🔧 Configuration
 
 ### Email Notifications
-Configure SMTP settings in `.env`:
+Create a Brevo API key and configure the verified sender address in the ignored `.env` file:
 ```env
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=your-email@gmail.com
-SMTP_PASSWORD=your-app-password
+BREVO_API_KEY=your-brevo-api-key
 EMAIL_FROM=noreply@bloodlife.com
 ```
 
@@ -275,7 +259,7 @@ LOGIN_RATE_LIMIT_MAX=5           # 5 login attempts per window
 
 1. Set `NODE_ENV=production` in `.env`
 2. Use a strong JWT_SECRET (min 32 characters)
-3. Configure proper SMTP credentials
+3. Configure Brevo API credentials and verify the sender domain
 4. Set up HTTPS/SSL
 5. Configure CORS allowed origins
 6. Use a process manager (PM2 recommended)

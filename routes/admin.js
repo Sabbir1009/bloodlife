@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const db = require('../config/firebase');
+const { pool } = require('../config/database');
 const logger = require('../utils/logger');
 const { asyncHandler, AppError } = require('../middleware/errorHandler');
 const { validate, validationRules } = require('../middleware/validator');
@@ -27,11 +27,13 @@ function authenticateToken(req, res, next) {
 router.post('/login', authLimiter, validate(validationRules.adminLogin), asyncHandler(async (req, res) => {
     const { username, password } = req.body;
 
-    const snap = await db.collection('admins').where('username', '==', username).limit(1).get();
-    if (snap.empty) throw new AppError('Invalid credentials', 401);
+    const { rows } = await pool.query(
+        'SELECT id, username, password_hash, role FROM admins WHERE username = $1 LIMIT 1',
+        [username]
+    );
+    if (rows.length === 0) throw new AppError('Invalid credentials', 401);
 
-    const adminDoc = snap.docs[0];
-    const admin = { id: adminDoc.id, ...adminDoc.data() };
+    const admin = rows[0];
 
     const validPassword = await bcrypt.compare(password, admin.password_hash);
     if (!validPassword) throw new AppError('Invalid credentials', 401);
@@ -57,46 +59,28 @@ router.get('/analytics', authenticateToken, asyncHandler(async (req, res) => {
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
     const thirtyDaysAgoStr = thirtyDaysAgo.toISOString().split('T')[0];
 
-    const [
-        totalDonorsSnap, availableDonorsSnap, totalRequestsSnap, pendingRequestsSnap,
-        allDonorsSnap, allRequestsSnap, recentDonationsSnap
-    ] = await Promise.all([
-        db.collection('donors').count().get(),
-        db.collection('donors').where('availability', '==', 1).count().get(),
-        db.collection('blood_requests').count().get(),
-        db.collection('blood_requests').where('status', '==', 'Pending').count().get(),
-        db.collection('donors').get(),
-        db.collection('blood_requests').get(),
-        db.collection('donations').where('donation_date', '>=', thirtyDaysAgoStr).count().get()
+    const [totalDonors, availableDonors, totalRequests, pendingRequests, donorsByBloodGroup, requestsByBloodGroup, requestsByStatus, recentDonations] = await Promise.all([
+        pool.query('SELECT COUNT(*)::int AS count FROM donors'),
+        pool.query('SELECT COUNT(*)::int AS count FROM donors WHERE availability = TRUE'),
+        pool.query('SELECT COUNT(*)::int AS count FROM blood_requests'),
+        pool.query("SELECT COUNT(*)::int AS count FROM blood_requests WHERE status = 'Pending'"),
+        pool.query('SELECT blood_group, COUNT(*)::int AS count FROM donors GROUP BY blood_group'),
+        pool.query('SELECT blood_group, COUNT(*)::int AS count FROM blood_requests GROUP BY blood_group'),
+        pool.query('SELECT status, COUNT(*)::int AS count FROM blood_requests GROUP BY status'),
+        pool.query('SELECT COUNT(*)::int AS count FROM donations WHERE donation_date >= $1', [thirtyDaysAgoStr])
     ]);
-
-    // Group donors by blood_group
-    const donorsByBloodGroup = {};
-    allDonorsSnap.docs.forEach(doc => {
-        const bg = doc.data().blood_group;
-        donorsByBloodGroup[bg] = (donorsByBloodGroup[bg] || 0) + 1;
-    });
-
-    // Group requests by blood_group and status
-    const requestsByBloodGroup = {};
-    const requestsByStatus = {};
-    allRequestsSnap.docs.forEach(doc => {
-        const { blood_group, status } = doc.data();
-        requestsByBloodGroup[blood_group] = (requestsByBloodGroup[blood_group] || 0) + 1;
-        requestsByStatus[status] = (requestsByStatus[status] || 0) + 1;
-    });
 
     res.json({
         success: true,
         data: {
-            totalDonors: [{ count: totalDonorsSnap.data().count }],
-            availableDonors: [{ count: availableDonorsSnap.data().count }],
-            totalRequests: [{ count: totalRequestsSnap.data().count }],
-            pendingRequests: [{ count: pendingRequestsSnap.data().count }],
-            donorsByBloodGroup: Object.entries(donorsByBloodGroup).map(([blood_group, count]) => ({ blood_group, count })),
-            requestsByBloodGroup: Object.entries(requestsByBloodGroup).map(([blood_group, count]) => ({ blood_group, count })),
-            requestsByStatus: Object.entries(requestsByStatus).map(([status, count]) => ({ status, count })),
-            recentDonations: [{ count: recentDonationsSnap.data().count }]
+            totalDonors: totalDonors.rows,
+            availableDonors: availableDonors.rows,
+            totalRequests: totalRequests.rows,
+            pendingRequests: pendingRequests.rows,
+            donorsByBloodGroup: donorsByBloodGroup.rows,
+            requestsByBloodGroup: requestsByBloodGroup.rows,
+            requestsByStatus: requestsByStatus.rows,
+            recentDonations: recentDonations.rows
         }
     });
 }));
@@ -105,12 +89,8 @@ router.get('/analytics', authenticateToken, asyncHandler(async (req, res) => {
 router.get('/users', authenticateToken, asyncHandler(async (req, res) => {
     if (req.user.role !== 'super_admin') throw new AppError('Access denied. Super admin only.', 403);
 
-    const snap = await db.collection('admins').get();
-    const admins = snap.docs.map(doc => {
-        const { password_hash, ...data } = doc.data();
-        return { id: doc.id, ...data };
-    });
-    res.json({ success: true, data: admins });
+    const { rows } = await pool.query('SELECT id, username, role, email, created_at, updated_at FROM admins ORDER BY created_at DESC');
+    res.json({ success: true, data: rows });
 }));
 
 // Create new admin (super_admin only)
@@ -121,20 +101,17 @@ router.post('/users', authenticateToken, asyncHandler(async (req, res) => {
     if (!username || !password) throw new AppError('Username and password are required', 400);
 
     // Check duplicate
-    const existing = await db.collection('admins').where('username', '==', username).limit(1).get();
-    if (!existing.empty) throw new AppError('Username already exists', 400);
+    const existing = await pool.query('SELECT 1 FROM admins WHERE username = $1 LIMIT 1', [username]);
+    if (existing.rowCount > 0) throw new AppError('Username already exists', 400);
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const ref = await db.collection('admins').add({
-        username,
-        password_hash: hashedPassword,
-        email: email || null,
-        role: role || 'admin',
-        created_at: new Date()
-    });
+    const { rows } = await pool.query(
+        'INSERT INTO admins (username, password_hash, email, role) VALUES ($1, $2, $3, $4) RETURNING id',
+        [username, hashedPassword, email || null, role || 'admin']
+    );
 
     logger.info(`New admin created: ${username} by ${req.user.username}`);
-    res.json({ success: true, message: 'Admin created successfully', id: ref.id });
+    res.json({ success: true, message: 'Admin created successfully', id: rows[0].id });
 }));
 
 module.exports = router;

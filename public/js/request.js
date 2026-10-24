@@ -32,10 +32,12 @@ class RequestManager {
 
     async getAllRequests() {
         try {
-            const response = await fetch(`${API_REQ_URL}/requests`);
-            const requests = await response.json();
-            // Map back to camelCase if needed by frontend, or adjust frontend
-            // Frontend expects: patientName, bloodGroup, unit, hospital, neededDate, phone
+            const response = await fetch(`${API_REQ_URL}/requests?limit=100`);
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.message || 'Failed to fetch requests');
+            const requests = Array.isArray(result) ? result : result.data;
+            if (!Array.isArray(requests)) throw new Error('Unexpected requests response');
+
             return requests.map(r => ({
                 id: r.id,
                 patientName: r.patient_name,

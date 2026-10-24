@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const db = require('../config/firebase');
+const { pool } = require('../config/database');
 const logger = require('../utils/logger');
 const { asyncHandler, AppError } = require('../middleware/errorHandler');
 const { validate, validationRules, passwordRules } = require('../middleware/validator');
@@ -36,34 +36,28 @@ router.post('/register', registerLimiter, validate([
 ]), asyncHandler(async (req, res) => {
     const { donor_id, email, password } = req.body;
 
-    const donorDoc = await db.collection('donors').doc(donor_id).get();
-    if (!donorDoc.exists || donorDoc.data().email !== email) {
+    const { rows: donors } = await pool.query('SELECT id, email, fullname FROM donors WHERE id = $1', [donor_id]);
+    if (donors.length === 0 || donors[0].email !== email) {
         throw new AppError('Donor not found. Please register as donor first.', 404);
     }
 
-    const existingSnap = await db.collection('donor_accounts')
-        .where('donor_id', '==', donor_id).limit(1).get();
-    if (!existingSnap.empty) throw new AppError('Account already exists', 400);
-
-    const existingEmailSnap = await db.collection('donor_accounts')
-        .where('email', '==', email).limit(1).get();
-    if (!existingEmailSnap.empty) throw new AppError('Account already exists', 400);
+    const existing = await pool.query(
+        'SELECT 1 FROM donor_accounts WHERE donor_id = $1 OR email = $2 LIMIT 1',
+        [donor_id, email]
+    );
+    if (existing.rowCount > 0) throw new AppError('Account already exists', 400);
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const ref = await db.collection('donor_accounts').add({
-        donor_id,
-        email,
-        password_hash: hashedPassword,
-        is_verified: 0,
-        last_login: null,
-        created_at: new Date()
-    });
+    const { rows } = await pool.query(
+        'INSERT INTO donor_accounts (donor_id, email, password_hash) VALUES ($1, $2, $3) RETURNING id',
+        [donor_id, email, hashedPassword]
+    );
 
     logger.info(`Donor account created: ${email}`);
-    notificationService.sendWelcomeEmail(email, donorDoc.data().fullname || 'Donor')
+    notificationService.sendWelcomeEmail(email, donors[0].fullname || 'Donor')
         .catch(e => logger.warn('Welcome email failed: ' + e.message));
 
-    res.json({ success: true, message: 'Account created successfully. Please login.', id: ref.id });
+    res.json({ success: true, message: 'Account created successfully. Please login.', id: rows[0].id });
 }));
 
 // Donor Login
@@ -73,17 +67,16 @@ router.post('/login', authLimiter, validate([
 ]), asyncHandler(async (req, res) => {
     const { email, password } = req.body;
 
-    const accountSnap = await db.collection('donor_accounts').where('email', '==', email).limit(1).get();
-    if (accountSnap.empty) throw new AppError('Invalid credentials', 401);
+    const { rows: accounts } = await pool.query('SELECT * FROM donor_accounts WHERE email = $1 LIMIT 1', [email]);
+    if (accounts.length === 0) throw new AppError('Invalid credentials', 401);
 
-    const accountDoc = accountSnap.docs[0];
-    const account = { id: accountDoc.id, ...accountDoc.data() };
+    const account = accounts[0];
 
     const validPassword = await bcrypt.compare(password, account.password_hash);
     if (!validPassword) throw new AppError('Invalid credentials', 401);
 
-    const donorDoc = await db.collection('donors').doc(account.donor_id).get();
-    const donor = donorDoc.data();
+    const { rows: donors } = await pool.query('SELECT * FROM donors WHERE id = $1', [account.donor_id]);
+    const donor = donors[0];
 
     const token = jwt.sign(
         { id: account.id, donor_id: account.donor_id, email: account.email, type: 'donor' },
@@ -91,7 +84,7 @@ router.post('/login', authLimiter, validate([
         { expiresIn: JWT_EXPIRY }
     );
 
-    db.collection('donor_accounts').doc(account.id).update({ last_login: new Date() }).catch(() => {});
+    pool.query('UPDATE donor_accounts SET last_login = NOW(), updated_at = NOW() WHERE id = $1', [account.id]).catch(() => {});
 
     logger.info(`Donor login: ${email}`);
     res.json({
@@ -104,19 +97,21 @@ router.post('/login', authLimiter, validate([
 
 // Get Donor Profile
 router.get('/profile', authenticateDonor, asyncHandler(async (req, res) => {
-    const donorDoc = await db.collection('donors').doc(req.user.donor_id).get();
-    if (!donorDoc.exists) throw new AppError('Profile not found', 404);
+    const { rows: donors } = await pool.query('SELECT * FROM donors WHERE id = $1', [req.user.donor_id]);
+    if (donors.length === 0) throw new AppError('Profile not found', 404);
 
-    const accountSnap = await db.collection('donor_accounts')
-        .where('donor_id', '==', req.user.donor_id).limit(1).get();
+    const { rows: accounts } = await pool.query(
+        'SELECT email, last_login FROM donor_accounts WHERE donor_id = $1 LIMIT 1',
+        [req.user.donor_id]
+    );
 
-    const donorData = donorDoc.data();
-    const accountData = accountSnap.empty ? {} : accountSnap.docs[0].data();
+    const donorData = donors[0];
+    const accountData = accounts[0] || {};
 
     res.json({
         success: true,
         data: {
-            id: donorDoc.id,
+            id: donorData.id,
             ...donorData,
             account_email: accountData.email,
             last_login: accountData.last_login
@@ -145,8 +140,16 @@ router.put('/profile', authenticateDonor, validate([
 
     if (Object.keys(updates).length === 0) throw new AppError('No fields to update', 400);
 
-    updates.updated_at = new Date();
-    await db.collection('donors').doc(req.user.donor_id).update(updates);
+    const fields = Object.keys(updates);
+    const assignments = fields.map((field, index) => `${field} = $${index + 1}`);
+    const values = fields.map(field => updates[field]);
+    assignments.push('updated_at = NOW()');
+    values.push(req.user.donor_id);
+    const result = await pool.query(
+        `UPDATE donors SET ${assignments.join(', ')} WHERE id = $${values.length}`,
+        values
+    );
+    if (result.rowCount === 0) throw new AppError('Profile not found', 404);
 
     logger.info(`Donor profile updated: ID ${req.user.donor_id}`);
     res.json({ success: true, message: 'Profile updated successfully' });
@@ -154,14 +157,14 @@ router.put('/profile', authenticateDonor, validate([
 
 // Get Donation History
 router.get('/donations', authenticateDonor, asyncHandler(async (req, res) => {
-    const snap = await db.collection('donations')
-        .where('donor_id', '==', req.user.donor_id)
-        .orderBy('donation_date', 'desc')
-        .get();
+    const { rows } = await pool.query(
+        'SELECT * FROM donations WHERE donor_id = $1 ORDER BY donation_date DESC',
+        [req.user.donor_id]
+    );
 
     res.json({
         success: true,
-        data: snap.docs.map(doc => ({ id: doc.id, ...doc.data() }))
+        data: rows
     });
 }));
 
@@ -175,10 +178,11 @@ router.post('/profile/picture', authenticateDonor, (req, res, next) => {
     if (!req.file) throw new AppError('No image file provided', 400);
 
     const profilePicturePath = req.file.path;
-    await db.collection('donors').doc(req.user.donor_id).update({
-        profile_picture: profilePicturePath,
-        updated_at: new Date()
-    });
+    const result = await pool.query(
+        'UPDATE donors SET profile_picture = $1, updated_at = NOW() WHERE id = $2',
+        [profilePicturePath, req.user.donor_id]
+    );
+    if (result.rowCount === 0) throw new AppError('Profile not found', 404);
 
     logger.info(`Profile picture updated: donor ID ${req.user.donor_id}`);
     res.json({
@@ -192,10 +196,10 @@ router.post('/profile/picture', authenticateDonor, (req, res, next) => {
 router.get('/eligibility', authenticateDonor, asyncHandler(async (req, res) => {
     const { isDonorEligible, getDaysUntilEligible } = require('../utils/bloodCompatibility');
 
-    const doc = await db.collection('donors').doc(req.user.donor_id).get();
-    if (!doc.exists) throw new AppError('Donor not found', 404);
+    const { rows } = await pool.query('SELECT last_donation_date FROM donors WHERE id = $1', [req.user.donor_id]);
+    if (rows.length === 0) throw new AppError('Donor not found', 404);
 
-    const { last_donation_date } = doc.data();
+    const { last_donation_date } = rows[0];
     const eligible = isDonorEligible(last_donation_date);
     const daysUntil = getDaysUntilEligible(last_donation_date);
 
